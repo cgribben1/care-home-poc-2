@@ -14,9 +14,10 @@ models/
 # PlatformIO build cache
 firmware/.pio/
 
-# Generated firmware headers (produced by convert_tflite.py)
+# Generated firmware headers (produced by convert_tflite.py / generate_model_header.py)
 firmware/include/model_data.h
 firmware/include/mel_filterbank.h
+firmware/include/model_weights.h
 
 # WiFi credentials — never commit
 firmware/include/wifi_config.h
