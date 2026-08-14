@@ -133,11 +133,13 @@ static void post_alert(const char* cls, float conf) {
 }
 
 static void post_heartbeat() {
-  char body[96];
+  char body[128];
   snprintf(body, sizeof(body),
     "{\"device_id\":\"" DEVICE_ID "\","
     "\"status\":\"online\","
+    "\"ip\":\"%s\","
     "\"rssi_dbm\":%d}",
+    WiFi.localIP().toString().c_str(),
     (int)WiFi.RSSI());
   http_post("/api/heartbeat", body);
 }
@@ -486,6 +488,7 @@ void setup() {
   });
   ArduinoOTA.begin();
   DIAGF("  OTA ready — hostname: %s\n", OTA_HOSTNAME);
+  DIAGF("  Device IP: %s\n", WiFi.localIP().toString().c_str());
 
   DIAG("=== READY — listening ===");
 }

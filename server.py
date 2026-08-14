@@ -67,7 +67,7 @@ def receive_event():
 def receive_heartbeat():
     data = request.get_json(force=True) or {}
     data["server_ts"] = time.time()
-    print(f"[HB] device={data.get('device_id','?')}  rssi={data.get('rssi_dbm','?')} dBm")
+    print(f"[HB] device={data.get('device_id','?')}  ip={data.get('ip','?')}  rssi={data.get('rssi_dbm','?')} dBm")
     socketio.emit("heartbeat", data)
     return jsonify({"ok": True})
 
