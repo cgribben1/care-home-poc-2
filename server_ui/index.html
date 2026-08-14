@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Care Home Monitor</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 1.5rem;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    header h1 { font-size: 1.25rem; font-weight: 600; letter-spacing: 0.02em; }
+
+    #status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+    #status-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      background: #6b7280;
+      transition: background 0.4s;
+      flex-shrink: 0;
+    }
+    #status-dot.online  { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    #status-dot.offline { background: #ef4444; box-shadow: 0 0 6px #ef444488; }
+    #status-label { color: #94a3b8; }
+
+    /* ── Alert banner ── */
+    #alert-banner {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      padding: 1rem 1.5rem;
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      animation: flash 0.4s ease-in-out 0s 6 alternate;
+    }
+    #alert-banner.show { display: flex; }
+    #alert-banner.fall   { background: #7f1d1d; color: #fca5a5; border-bottom: 2px solid #ef4444; }
+    #alert-banner.cough  { background: #78350f; color: #fcd34d; border-bottom: 2px solid #f59e0b; }
+    #alert-banner.other  { background: #1e293b; color: #94a3b8; border-bottom: 2px solid #64748b; }
+
+    @keyframes flash {
+      from { opacity: 1; }
+      to   { opacity: 0.3; }
+    }
+
+    #alert-icon { font-size: 2rem; }
+
+    /* ── Main content ── */
+    main { flex: 1; padding: 1.5rem; }
+
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 0.75rem;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 0.75rem 1rem;
+      background: #263348;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #94a3b8;
+    }
+
+    /* ── Event log table ── */
+    #event-log { width: 100%; border-collapse: collapse; }
+    #event-log th {
+      padding: 0.6rem 1rem;
+      text-align: left;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #64748b;
+      border-bottom: 1px solid #334155;
+    }
+    #event-log td {
+      padding: 0.65rem 1rem;
+      font-size: 0.875rem;
+      border-bottom: 1px solid #1e293b;
+    }
+    #event-log tr:hover td { background: #263348; }
+    #event-log .new-row td { animation: highlight 1.5s ease-out forwards; }
+    @keyframes highlight {
+      from { background: #1d4ed888; }
+      to   { background: transparent; }
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .badge-fall   { background: #450a0a; color: #fca5a5; }
+    .badge-cough  { background: #451a03; color: #fcd34d; }
+    .badge-normal { background: #052e16; color: #86efac; }
+    .badge-other  { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+
+    #empty-state {
+      padding: 2rem;
+      text-align: center;
+      color: #475569;
+      font-size: 0.875rem;
+    }
+
+    /* ── Conf bar ── */
+    .conf-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8rem;
+    }
+    .conf-track {
+      flex: 1;
+      height: 6px;
+      background: #334155;
+      border-radius: 3px;
+      overflow: hidden;
+      max-width: 120px;
+    }
+    .conf-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .conf-fill-fall  { background: #ef4444; }
+    .conf-fill-cough { background: #f59e0b; }
+    .conf-fill-other { background: #64748b; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🏠 Care Home Monitor</h1>
+  <div id="status">
+    <div id="status-dot"></div>
+    <span id="status-label">Waiting…</span>
+  </div>
+</header>
+
+<div id="alert-banner">
+  <span id="alert-icon"></span>
+  <span id="alert-text"></span>
+</div>
+
+<main>
+  <div class="card">
+    <div class="card-header">Event Log</div>
+    <div id="empty-state">No events yet — device will appear here once online.</div>
+    <table id="event-log" style="display:none">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Class</th>
+          <th>Confidence</th>
+          <th>Device</th>
+        </tr>
+      </thead>
+      <tbody id="log-body"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+  const socket = io();
+  const dot    = document.getElementById('status-dot');
+  const label  = document.getElementById('status-label');
+  const banner = document.getElementById('alert-banner');
+  const logTable  = document.getElementById('event-log');
+  const logBody   = document.getElementById('log-body');
+  const emptyState = document.getElementById('empty-state');
+
+  const HEARTBEAT_TIMEOUT = 30000; // 30s
+  let heartbeatTimer = null;
+
+  function setOnline() {
+    dot.className = 'online';
+    label.textContent = 'ONLINE';
+  }
+  function setOffline() {
+    dot.className = 'offline';
+    label.textContent = 'OFFLINE';
+  }
+
+  function resetHeartbeatTimer() {
+    clearTimeout(heartbeatTimer);
+    setOnline();
+    heartbeatTimer = setTimeout(setOffline, HEARTBEAT_TIMEOUT);
+  }
+
+  socket.on('heartbeat', resetHeartbeatTimer);
+
+  const CLASS_ICONS = { fall: '🚨', cough: '😷', normal: '✅', other: '🔔' };
+
+  function showBanner(cls, conf) {
+    if (cls === 'normal') return;
+    banner.className = `alert-banner show ${cls}`;
+    document.getElementById('alert-icon').textContent = CLASS_ICONS[cls] || '⚠️';
+    document.getElementById('alert-text').textContent =
+      `${cls.toUpperCase()} DETECTED — ${(conf * 100).toFixed(0)}%`;
+    clearTimeout(banner._timer);
+    banner._timer = setTimeout(() => {
+      banner.classList.remove('show');
+    }, 6000);
+  }
+
+  function addLogRow(data) {
+    emptyState.style.display = 'none';
+    logTable.style.display = 'table';
+
+    const ts = new Date(data.server_ts * 1000).toLocaleTimeString();
+    const cls = data.class || 'other';
+    const conf = data.confidence || 0;
+    const device = data.device_id || 'device';
+
+    const confPct = (conf * 100).toFixed(1);
+    const fillClass = `conf-fill-${cls}`;
+
+    const tr = document.createElement('tr');
+    tr.className = 'new-row';
+    tr.innerHTML = `
+      <td>${ts}</td>
+      <td><span class="badge badge-${cls}">${cls}</span></td>
+      <td>
+        <div class="conf-bar">
+          <div class="conf-track"><div class="conf-fill ${fillClass}" style="width:${confPct}%"></div></div>
+          <span>${confPct}%</span>
+        </div>
+      </td>
+      <td style="color:#64748b;font-size:0.8rem">${device}</td>
+    `;
+
+    logBody.insertBefore(tr, logBody.firstChild);
+
+    // Keep max 100 rows
+    while (logBody.rows.length > 100) logBody.deleteRow(logBody.rows.length - 1);
+  }
+
+  socket.on('alert', (data) => {
+    resetHeartbeatTimer();
+    showBanner(data.class, data.confidence);
+    addLogRow(data);
+  });
+</script>
+</body>
+</html>

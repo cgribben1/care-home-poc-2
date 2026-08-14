@@ -1,0 +1,32 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.gradio/
+.env
+.env.*
+
+# Generated / local data
+data/
+models/
+*.wav
+
+# PlatformIO build cache
+firmware/.pio/
+
+# Generated firmware headers (produced by convert_tflite.py)
+firmware/include/model_data.h
+firmware/include/mel_filterbank.h
+
+# WiFi credentials — never commit
+firmware/include/wifi_config.h
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Temp debug output
+_ui_test.txt
