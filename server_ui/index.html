@@ -1,273 +1,215 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Care Home Monitor</title>
-  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Care-Home Monitor</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1117; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; padding: 20px; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 4px; }
+  .subtitle { font-size: 0.8rem; color: #64748b; margin-bottom: 20px; }
 
-    body {
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      background: #0f172a;
-      color: #e2e8f0;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
+  .status-bar {
+    display: flex; align-items: center; gap: 12px;
+    background: #1e2130; border-radius: 10px; padding: 10px 16px;
+    margin-bottom: 20px; font-size: 0.85rem;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #334155; flex-shrink: 0; }
+  .dot.online { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .dot.alert  { background: #ef4444; box-shadow: 0 0 8px #ef4444; animation: pulse 0.6s infinite alternate; }
+  @keyframes pulse { from { opacity: 1; } to { opacity: 0.3; } }
+  .status-label { font-weight: 600; }
+  .status-detail { color: #64748b; margin-left: auto; font-size: 0.75rem; }
 
-    /* ── Header ── */
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 1rem 1.5rem;
-      background: #1e293b;
-      border-bottom: 1px solid #334155;
-    }
-    header h1 { font-size: 1.25rem; font-weight: 600; letter-spacing: 0.02em; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
 
-    #status {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      font-size: 0.875rem;
-      font-weight: 500;
-    }
-    #status-dot {
-      width: 12px; height: 12px;
-      border-radius: 50%;
-      background: #6b7280;
-      transition: background 0.4s;
-      flex-shrink: 0;
-    }
-    #status-dot.online  { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
-    #status-dot.offline { background: #ef4444; box-shadow: 0 0 6px #ef444488; }
-    #status-label { color: #94a3b8; }
+  .card { background: #1e2130; border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 12px; }
 
-    /* ── Alert banner ── */
-    #alert-banner {
-      display: none;
-      align-items: center;
-      justify-content: center;
-      gap: 1rem;
-      padding: 1rem 1.5rem;
-      font-size: 1.5rem;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      animation: flash 0.4s ease-in-out 0s 6 alternate;
-    }
-    #alert-banner.show { display: flex; }
-    #alert-banner.fall   { background: #7f1d1d; color: #fca5a5; border-bottom: 2px solid #ef4444; }
-    #alert-banner.cough  { background: #78350f; color: #fcd34d; border-bottom: 2px solid #f59e0b; }
-    #alert-banner.other  { background: #1e293b; color: #94a3b8; border-bottom: 2px solid #64748b; }
+  .rms-value { font-size: 2rem; font-weight: 700; color: #38bdf8; margin-bottom: 2px; }
+  .rms-meta  { font-size: 0.75rem; color: #64748b; margin-bottom: 12px; }
 
-    @keyframes flash {
-      from { opacity: 1; }
-      to   { opacity: 0.3; }
-    }
+  .prob-bars { display: flex; flex-direction: column; gap: 10px; }
+  .prob-row  { display: flex; align-items: center; gap: 10px; font-size: 0.82rem; }
+  .prob-label { width: 52px; text-align: right; color: #94a3b8; }
+  .prob-track { flex: 1; background: #0f1117; border-radius: 4px; height: 18px; overflow: hidden; }
+  .prob-fill  { height: 100%; border-radius: 4px; transition: width 0.4s ease; width: 0%; }
+  .prob-pct   { width: 44px; font-size: 0.78rem; color: #94a3b8; }
+  .prob-fill.fall   { background: #ef4444; }
+  .prob-fill.cough  { background: #f97316; }
+  .prob-fill.normal { background: #22c55e; }
+  .prob-fill.other  { background: #64748b; }
+  .infer-stat { font-size: 0.8rem; color: #64748b; margin-top: 10px; }
+  .infer-stat span { color: #e2e8f0; font-weight: 600; }
 
-    #alert-icon { font-size: 2rem; }
-
-    /* ── Main content ── */
-    main { flex: 1; padding: 1.5rem; }
-
-    .card {
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 0.75rem;
-      overflow: hidden;
-    }
-    .card-header {
-      padding: 0.75rem 1rem;
-      background: #263348;
-      font-size: 0.8rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: #94a3b8;
-    }
-
-    /* ── Event log table ── */
-    #event-log { width: 100%; border-collapse: collapse; }
-    #event-log th {
-      padding: 0.6rem 1rem;
-      text-align: left;
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: #64748b;
-      border-bottom: 1px solid #334155;
-    }
-    #event-log td {
-      padding: 0.65rem 1rem;
-      font-size: 0.875rem;
-      border-bottom: 1px solid #1e293b;
-    }
-    #event-log tr:hover td { background: #263348; }
-    #event-log .new-row td { animation: highlight 1.5s ease-out forwards; }
-    @keyframes highlight {
-      from { background: #1d4ed888; }
-      to   { background: transparent; }
-    }
-
-    .badge {
-      display: inline-block;
-      padding: 0.2rem 0.6rem;
-      border-radius: 9999px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .badge-fall   { background: #450a0a; color: #fca5a5; }
-    .badge-cough  { background: #451a03; color: #fcd34d; }
-    .badge-normal { background: #052e16; color: #86efac; }
-    .badge-other  { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
-
-    #empty-state {
-      padding: 2rem;
-      text-align: center;
-      color: #475569;
-      font-size: 0.875rem;
-    }
-
-    /* ── Conf bar ── */
-    .conf-bar {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      font-size: 0.8rem;
-    }
-    .conf-track {
-      flex: 1;
-      height: 6px;
-      background: #334155;
-      border-radius: 3px;
-      overflow: hidden;
-      max-width: 120px;
-    }
-    .conf-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
-    .conf-fill-fall  { background: #ef4444; }
-    .conf-fill-cough { background: #f59e0b; }
-    .conf-fill-other { background: #64748b; }
-  </style>
+  .event-log { background: #1e2130; border-radius: 12px; padding: 16px; }
+  .event-log h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 12px; }
+  .log-empty { color: #334155; font-size: 0.82rem; text-align: center; padding: 20px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { color: #475569; font-weight: 500; text-align: left; padding: 4px 8px; border-bottom: 1px solid #0f1117; }
+  td { padding: 6px 8px; border-bottom: 1px solid #0f1117; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; }
+  .badge.fall  { background: #7f1d1d; color: #fca5a5; }
+  .badge.cough { background: #7c2d12; color: #fdba74; }
+</style>
 </head>
 <body>
 
-<header>
-  <h1>🏠 Care Home Monitor</h1>
-  <div id="status">
-    <div id="status-dot"></div>
-    <span id="status-label">Waiting…</span>
-  </div>
-</header>
+<h1>Care-Home Acoustic Monitor</h1>
+<p class="subtitle">Live telemetry · ESP32S3 + SPH0645</p>
 
-<div id="alert-banner">
-  <span id="alert-icon"></span>
-  <span id="alert-text"></span>
+<div class="status-bar">
+  <div class="dot" id="statusDot"></div>
+  <span class="status-label" id="statusLabel">Waiting for device...</span>
+  <span class="status-detail" id="statusDetail"></span>
 </div>
 
-<main>
+<div class="grid">
   <div class="card">
-    <div class="card-header">Event Log</div>
-    <div id="empty-state">No events yet — device will appear here once online.</div>
-    <table id="event-log" style="display:none">
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Class</th>
-          <th>Confidence</th>
-          <th>Device</th>
-        </tr>
-      </thead>
-      <tbody id="log-body"></tbody>
-    </table>
+    <h2>Audio Level (RMS)</h2>
+    <div class="rms-value" id="rmsValue">—</div>
+    <div class="rms-meta">Current &nbsp;·&nbsp; threshold 0.025</div>
+    <canvas id="rmsChart" height="90"></canvas>
   </div>
-</main>
+
+  <div class="card">
+    <h2>Class Probabilities</h2>
+    <div class="prob-bars">
+      <div class="prob-row">
+        <span class="prob-label">Fall</span>
+        <div class="prob-track"><div class="prob-fill fall"   id="pFall"></div></div>
+        <span class="prob-pct" id="vFall">—</span>
+      </div>
+      <div class="prob-row">
+        <span class="prob-label">Cough</span>
+        <div class="prob-track"><div class="prob-fill cough"  id="pCough"></div></div>
+        <span class="prob-pct" id="vCough">—</span>
+      </div>
+      <div class="prob-row">
+        <span class="prob-label">Normal</span>
+        <div class="prob-track"><div class="prob-fill normal" id="pNormal"></div></div>
+        <span class="prob-pct" id="vNormal">—</span>
+      </div>
+      <div class="prob-row">
+        <span class="prob-label">Other</span>
+        <div class="prob-track"><div class="prob-fill other"  id="pOther"></div></div>
+        <span class="prob-pct" id="vOther">—</span>
+      </div>
+    </div>
+    <div class="infer-stat">Inference time: <span id="inferMs">—</span></div>
+    <div class="infer-stat">Windows processed: <span id="windowCount">0</span></div>
+  </div>
+</div>
+
+<div class="event-log">
+  <h2>Alert Events</h2>
+  <div class="log-empty" id="logEmpty">No alerts yet</div>
+  <table id="logTable" style="display:none">
+    <thead><tr><th>Time</th><th>Class</th><th>Confidence</th><th>Device</th></tr></thead>
+    <tbody id="logBody"></tbody>
+  </table>
+</div>
 
 <script>
-  const socket = io();
-  const dot    = document.getElementById('status-dot');
-  const label  = document.getElementById('status-label');
-  const banner = document.getElementById('alert-banner');
-  const logTable  = document.getElementById('event-log');
-  const logBody   = document.getElementById('log-body');
-  const emptyState = document.getElementById('empty-state');
+const socket = io();
 
-  const HEARTBEAT_TIMEOUT = 30000; // 30s
-  let heartbeatTimer = null;
-
-  function setOnline() {
-    dot.className = 'online';
-    label.textContent = 'ONLINE';
+// ── RMS sparkline ─────────────────────────────────────────────────────────────
+const MAX_PTS = 60;
+const rmsData = {
+  labels: [],
+  datasets: [{
+    data: [], borderColor: '#38bdf8',
+    backgroundColor: 'rgba(56,189,248,0.07)',
+    borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3
+  }]
+};
+const rmsChart = new Chart(document.getElementById('rmsChart').getContext('2d'), {
+  type: 'line', data: rmsData,
+  options: {
+    animation: false, responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { display: false },
+      y: { min: 0, suggestedMax: 0.15,
+           grid: { color: '#0f1117' },
+           ticks: { color: '#475569', font: { size: 10 }, maxTicksLimit: 4 } }
+    }
   }
-  function setOffline() {
-    dot.className = 'offline';
-    label.textContent = 'OFFLINE';
+});
+
+function pushRms(val) {
+  rmsData.labels.push('');
+  rmsData.datasets[0].data.push(+val.toFixed(4));
+  if (rmsData.labels.length > MAX_PTS) {
+    rmsData.labels.shift();
+    rmsData.datasets[0].data.shift();
   }
+  rmsChart.update('none');
+}
 
-  function resetHeartbeatTimer() {
-    clearTimeout(heartbeatTimer);
-    setOnline();
-    heartbeatTimer = setTimeout(setOffline, HEARTBEAT_TIMEOUT);
-  }
+// ── Status ────────────────────────────────────────────────────────────────────
+let lastSeen = null;
 
-  socket.on('heartbeat', resetHeartbeatTimer);
+function setOnline(deviceId) {
+  document.getElementById('statusDot').className = 'dot online';
+  document.getElementById('statusLabel').textContent = deviceId || 'Device online';
+  lastSeen = Date.now();
+}
 
-  const CLASS_ICONS = { fall: '🚨', cough: '😷', normal: '✅', other: '🔔' };
+setInterval(() => {
+  if (!lastSeen) return;
+  const s = Math.round((Date.now() - lastSeen) / 1000);
+  document.getElementById('statusDetail').textContent = 'Last seen ' + s + 's ago';
+}, 1000);
 
-  function showBanner(cls, conf) {
-    if (cls === 'normal') return;
-    banner.className = `alert-banner show ${cls}`;
-    document.getElementById('alert-icon').textContent = CLASS_ICONS[cls] || '⚠️';
-    document.getElementById('alert-text').textContent =
-      `${cls.toUpperCase()} DETECTED — ${(conf * 100).toFixed(0)}%`;
-    clearTimeout(banner._timer);
-    banner._timer = setTimeout(() => {
-      banner.classList.remove('show');
-    }, 6000);
-  }
-
-  function addLogRow(data) {
-    emptyState.style.display = 'none';
-    logTable.style.display = 'table';
-
-    const ts = new Date(data.server_ts * 1000).toLocaleTimeString();
-    const cls = data.class || 'other';
-    const conf = data.confidence || 0;
-    const device = data.device_id || 'device';
-
-    const confPct = (conf * 100).toFixed(1);
-    const fillClass = `conf-fill-${cls}`;
-
-    const tr = document.createElement('tr');
-    tr.className = 'new-row';
-    tr.innerHTML = `
-      <td>${ts}</td>
-      <td><span class="badge badge-${cls}">${cls}</span></td>
-      <td>
-        <div class="conf-bar">
-          <div class="conf-track"><div class="conf-fill ${fillClass}" style="width:${confPct}%"></div></div>
-          <span>${confPct}%</span>
-        </div>
-      </td>
-      <td style="color:#64748b;font-size:0.8rem">${device}</td>
-    `;
-
-    logBody.insertBefore(tr, logBody.firstChild);
-
-    // Keep max 100 rows
-    while (logBody.rows.length > 100) logBody.deleteRow(logBody.rows.length - 1);
-  }
-
-  socket.on('alert', (data) => {
-    resetHeartbeatTimer();
-    showBanner(data.class, data.confidence);
-    addLogRow(data);
+// ── Probabilities ─────────────────────────────────────────────────────────────
+function updateProbs(probs) {
+  const fills = ['pFall','pCough','pNormal','pOther'];
+  const vals  = ['vFall','vCough','vNormal','vOther'];
+  probs.forEach((p, i) => {
+    const pct = (p * 100).toFixed(1);
+    document.getElementById(fills[i]).style.width = pct + '%';
+    document.getElementById(vals[i]).textContent  = pct + '%';
   });
+}
+
+// ── Telemetry ─────────────────────────────────────────────────────────────────
+let windowCount = 0;
+socket.on('telemetry', d => {
+  setOnline(d.device_id);
+  windowCount++;
+  document.getElementById('windowCount').textContent = windowCount;
+  document.getElementById('rmsValue').textContent = (+d.rms).toFixed(4);
+  pushRms(+d.rms);
+  if (d.probs) updateProbs(d.probs);
+  if (d.inference_ms != null)
+    document.getElementById('inferMs').textContent = d.inference_ms + ' ms';
+});
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+socket.on('heartbeat', d => setOnline(d.device_id));
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+socket.on('alert', d => {
+  const dot = document.getElementById('statusDot');
+  dot.className = 'dot alert';
+  setTimeout(() => { dot.className = 'dot online'; }, 3000);
+
+  document.getElementById('logEmpty').style.display = 'none';
+  document.getElementById('logTable').style.display = 'table';
+
+  const tr = document.createElement('tr');
+  const t  = new Date(d.server_ts * 1000).toLocaleTimeString();
+  const cls = d.class || '';
+  tr.innerHTML = `<td>${t}</td><td><span class="badge ${cls}">${cls}</span></td>`
+               + `<td>${((d.confidence||0)*100).toFixed(1)}%</td><td>${d.device_id||''}</td>`;
+  document.getElementById('logBody').prepend(tr);
+});
 </script>
 </body>
 </html>

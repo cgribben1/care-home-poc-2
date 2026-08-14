@@ -1,4 +1,4 @@
-"""Care-home event server — receives alerts + heartbeats from ESP32, serves dashboard."""
+"""Care-home event server — receives telemetry + alerts from ESP32, serves dashboard."""
 
 from __future__ import annotations
 
@@ -16,6 +16,14 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/telemetry", methods=["POST"])
+def receive_telemetry():
+    data = request.get_json(force=True) or {}
+    data["server_ts"] = time.time()
+    socketio.emit("telemetry", data)
+    return jsonify({"ok": True})
 
 
 @app.route("/event", methods=["POST"])
