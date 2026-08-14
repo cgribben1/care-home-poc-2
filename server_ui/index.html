@@ -18,8 +18,9 @@
     margin-bottom: 20px; font-size: 0.85rem;
   }
   .dot { width: 10px; height: 10px; border-radius: 50%; background: #334155; flex-shrink: 0; }
-  .dot.online { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
-  .dot.alert  { background: #ef4444; box-shadow: 0 0 8px #ef4444; animation: pulse 0.6s infinite alternate; }
+  .dot.online  { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .dot.offline { background: #ef4444; }
+  .dot.alert   { background: #ef4444; box-shadow: 0 0 8px #ef4444; animation: pulse 0.6s infinite alternate; }
   @keyframes pulse { from { opacity: 1; } to { opacity: 0.3; } }
   .status-label { font-weight: 600; }
   .status-detail { color: #64748b; margin-left: auto; font-size: 0.75rem; }
@@ -153,18 +154,29 @@ function pushRms(val) {
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
+const OFFLINE_TIMEOUT_MS = 45000;
 let lastSeen = null;
+let lastDeviceId = null;
+let alertActive = false;
 
 function setOnline(deviceId) {
-  document.getElementById('statusDot').className = 'dot online';
-  document.getElementById('statusLabel').textContent = deviceId || 'Device online';
+  lastDeviceId = deviceId || lastDeviceId;
   lastSeen = Date.now();
+  if (!alertActive) {
+    document.getElementById('statusDot').className = 'dot online';
+    document.getElementById('statusLabel').textContent = lastDeviceId || 'Device online';
+  }
 }
 
 setInterval(() => {
   if (!lastSeen) return;
-  const s = Math.round((Date.now() - lastSeen) / 1000);
+  const ms = Date.now() - lastSeen;
+  const s  = Math.round(ms / 1000);
   document.getElementById('statusDetail').textContent = 'Last seen ' + s + 's ago';
+  if (ms > OFFLINE_TIMEOUT_MS && !alertActive) {
+    document.getElementById('statusDot').className = 'dot offline';
+    document.getElementById('statusLabel').textContent = 'Device offline';
+  }
 }, 1000);
 
 // ── Probabilities ─────────────────────────────────────────────────────────────
@@ -197,8 +209,12 @@ socket.on('heartbeat', d => setOnline(d.device_id));
 // ── Alerts ────────────────────────────────────────────────────────────────────
 socket.on('alert', d => {
   const dot = document.getElementById('statusDot');
+  alertActive = true;
   dot.className = 'dot alert';
-  setTimeout(() => { dot.className = 'dot online'; }, 3000);
+  setTimeout(() => {
+    alertActive = false;
+    dot.className = lastSeen && (Date.now() - lastSeen < OFFLINE_TIMEOUT_MS) ? 'dot online' : 'dot offline';
+  }, 3000);
 
   document.getElementById('logEmpty').style.display = 'none';
   document.getElementById('logTable').style.display = 'table';
