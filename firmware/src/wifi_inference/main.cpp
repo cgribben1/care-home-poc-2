@@ -2,13 +2,13 @@
  * Care-home acoustic monitor — on-device inference over WiFi
  * XIAO ESP32S3 Plus + Adafruit SPH0645LM4H
  *
- * Wiring: DOUT->D0  BCLK->D1  LRCL->D2  3V->3V3  GND->GND  SEL->GND
+ * Wiring: DOUT->D6(GPIO43)  BCLK->D4(GPIO5)  LRCL->D5(GPIO6)  3V->3V3  GND->GND  SEL->GND
  *
  * Pipeline:
- *   I2S → RMS gate → log-mel spectrogram → CNN (manual C++ forward pass) → HTTP POST
+ *   I2S → RMS gate → log-mel spectrogram → TFLite INT8 CNN → HTTP POST
  *
  * Run before building:
- *   python generate_model_header.py   (generates firmware/include/model_weights.h)
+ *   python convert_tflite.py   (generates firmware/include/model_data.h + mel_filterbank.h)
  */
 
 #include <Arduino.h>
@@ -19,11 +19,17 @@
 #include <esp_dsp.h>
 #include <math.h>
 
-#include "wifi_config.h"
-#include "mel_filterbank.h"
-#include "model_weights.h"   // weights + cnn_infer() — no TFLite dependency
+// TFLite Micro runtime (from tflm_esp32 library)
+// tflm_esp32.h pulls in micro_interpreter.h, micro_mutable_op_resolver.h,
+// system_setup.h, and schema_generated.h
+#include <esp_heap_caps.h>
+#include <tflm_esp32.h>
 
-// ── I2S pins ────────────────────────────────────────────────────────────────
+#include "wifi_config.h"
+#include "model_data.h"
+#include "mel_filterbank.h"
+
+// ── I2S pins ─────────────────────────────────────────────────────────────────
 #ifndef PIN_I2S_SD
 #define PIN_I2S_SD  1
 #endif
@@ -35,40 +41,42 @@
 #endif
 #define PCM_SHIFT 15
 
-// ── Audio / mel parameters — must match train_cnn.py ────────────────────────
-static const int kSampleRate    = 16000;
-static const int kAudioSamples  = 16000;
-static const int kNFft          = MEL_N_FFT;
-static const int kFftBins       = MEL_FFT_BINS;
-static const int kNMels         = MEL_N_MELS;
-static const int kNFrames       = MEL_N_FRAMES;
-static const int kHop           = MEL_HOP;
-static const int kDmaChunk      = 320;
-
+// ── Audio / mel parameters ────────────────────────────────────────────────────
+static const int kSampleRate   = 16000;
+static const int kAudioSamples = MEL_N_SAMPLES;  // 16384 (1.024s)
+static const int kNFft         = MEL_N_FFT;
+static const int kFftBins      = MEL_FFT_BINS;
+static const int kNMels        = MEL_N_MELS;
+static const int kNFrames      = MEL_N_FRAMES;
+static const int kHop          = MEL_HOP;
+static const int kDmaChunk     = 320;
 static const float kRmsThreshold = 0.025f;
 
-// ── Detection thresholds ─────────────────────────────────────────────────────
+// ── Detection thresholds ──────────────────────────────────────────────────────
 static const int   kNClasses = 4;
-static const char* kClassNames[kNClasses]  = {"fall", "cough", "normal", "other"};
-static const float kThresholds[kNClasses]  = {0.88f, 0.85f, 0.0f, 0.0f};
-static const float kNonAlertMaxCombined    = 0.40f;
-static const float kNonAlertMargin         = 0.35f;
+static const char* kClassNames[kNClasses] = {"fall", "cough", "normal", "other"};
+static const float kThresholds[kNClasses] = {0.88f, 0.85f, 0.0f, 0.0f};
+static const float kNonAlertMaxCombined   = 0.40f;
+static const float kNonAlertMargin        = 0.35f;
 
-// ── CNN scratch buffers (PSRAM) ──────────────────────────────────────────────
-// buf_a needs ≥ 198,656 floats (Conv0 output: 97×64×32)
-// buf_b needs ≥  49,152 floats (MaxPool0 output: 48×32×32)
-static float* cnn_buf_a = nullptr;
-static float* cnn_buf_b = nullptr;
+// ── TFLite Micro (PSRAM arena) ────────────────────────────────────────────────
+// Arena in PSRAM: avoids DRAM pressure; INT8 model needs ~218 KB peak.
+// resolver is a static local in setup() to avoid global-constructor crashes.
+static const int kArenaSize = 1 * 1024 * 1024;  // 1 MB in PSRAM (§5.1)
+static uint8_t*                  tensor_arena  = nullptr;
+static tflite::MicroInterpreter* interpreter   = nullptr;
+static TfLiteTensor*             input_tensor  = nullptr;
+static TfLiteTensor*             output_tensor = nullptr;
 
-// ── Audio buffers (PSRAM) ────────────────────────────────────────────────────
+// ── Audio buffers (PSRAM) ─────────────────────────────────────────────────────
 static int32_t* dma_buf   = nullptr;
 static float*   audio_buf = nullptr;
 static float*   fft_buf   = nullptr;
 static float*   mel_buf   = nullptr;
 static float*   hann_win  = nullptr;
 
-// ── Timing ───────────────────────────────────────────────────────────────────
 static unsigned long last_heartbeat_ms = 0;
+static const unsigned long kHeartbeatInterval = 30000UL;  // §6.3: 30-second heartbeat
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WiFi helpers
@@ -80,15 +88,12 @@ static void wifi_connect() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 30) {
-    delay(500);
-    Serial.print('.');
-    retries++;
+    delay(500); Serial.print('.'); retries++;
   }
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED)
     Serial.printf("\nWiFi OK  IP=%s\n", WiFi.localIP().toString().c_str());
-  } else {
+  else
     Serial.println("\nWiFi FAILED — will retry");
-  }
 }
 
 static void http_post(const char* path, const char* json_body) {
@@ -107,18 +112,51 @@ static void http_post(const char* path, const char* json_body) {
 }
 
 static void post_alert(const char* cls, float conf) {
-  char body[128];
+  char body[192];
   snprintf(body, sizeof(body),
-    "{\"class\":\"%s\",\"confidence\":%.3f,\"device_id\":\"" DEVICE_ID "\"}",
-    cls, conf);
+    "{\"device_id\":\"" DEVICE_ID "\","
+    "\"event_type\":\"%s\","
+    "\"confidence\":%.3f,"
+    "\"uptime_ms\":%lu,"
+    "\"rssi_dbm\":%d}",
+    cls, conf, millis(), (int)WiFi.RSSI());
   Serial.printf("[ALERT] %s  %.1f%%\n", cls, conf * 100.0f);
-  http_post("/event", body);
+  http_post("/api/alert", body);
 }
 
 static void post_heartbeat() {
-  char body[64];
-  snprintf(body, sizeof(body), "{\"device_id\":\"" DEVICE_ID "\"}");
-  http_post("/heartbeat", body);
+  char body[96];
+  snprintf(body, sizeof(body),
+    "{\"device_id\":\"" DEVICE_ID "\","
+    "\"status\":\"online\","
+    "\"rssi_dbm\":%d}",
+    (int)WiFi.RSSI());
+  http_post("/api/heartbeat", body);
+}
+
+static void post_telemetry(float rms, bool ran_inference,
+                           const float* probs, unsigned long infer_ms,
+                           const char* alert_cls) {
+  char body[256];
+  if (ran_inference && probs) {
+    if (alert_cls) {
+      snprintf(body, sizeof(body),
+        "{\"device_id\":\"" DEVICE_ID "\",\"rms\":%.4f"
+        ",\"probs\":[%.3f,%.3f,%.3f,%.3f]"
+        ",\"inference_ms\":%lu,\"alert\":\"%s\"}",
+        rms, probs[0], probs[1], probs[2], probs[3], infer_ms, alert_cls);
+    } else {
+      snprintf(body, sizeof(body),
+        "{\"device_id\":\"" DEVICE_ID "\",\"rms\":%.4f"
+        ",\"probs\":[%.3f,%.3f,%.3f,%.3f]"
+        ",\"inference_ms\":%lu,\"alert\":null}",
+        rms, probs[0], probs[1], probs[2], probs[3], infer_ms);
+    }
+  } else {
+    snprintf(body, sizeof(body),
+      "{\"device_id\":\"" DEVICE_ID "\",\"rms\":%.4f}", rms);
+  }
+  http_post("/telemetry", body);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,6 +168,9 @@ static bool init_i2s() {
     .mode              = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate       = (uint32_t)kSampleRate,
     .bits_per_sample   = I2S_BITS_PER_SAMPLE_32BIT,
+    // Stereo RIGHT_LEFT: ESP32-S3 old API doesn't fill DMA in ONLY_LEFT/mono mode.
+    // With RIGHT_LEFT, DMA is [R0, L0, R1, L1, ...].
+    // SPH0645 SEL=GND → outputs during WS=LOW (LEFT I2S channel) → ODD indices.
     .channel_format    = I2S_CHANNEL_FMT_RIGHT_LEFT,
 #if defined(I2S_COMM_FORMAT_I2S_MSB)
     .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
@@ -158,16 +199,28 @@ static bool init_i2s() {
   return true;
 }
 
+static void detect_channel() {
+  // Mono mode — no interleave detection needed.
+  // Warm up DMA with a few reads and print a sample raw value for debugging.
+  const int read_bytes = kDmaChunk * sizeof(int32_t);
+  size_t bytes_read = 0;
+  for (int round = 0; round < 4; round++)
+    i2s_read(I2S_NUM_0, dma_buf, read_bytes, &bytes_read, pdMS_TO_TICKS(200));
+  Serial.printf("I2S mono warm-up done, sample raw[0]=0x%08lx\n", (unsigned long)dma_buf[0]);
+}
+
 static bool collect_audio() {
   int collected = 0;
+  // Stereo: read kDmaChunk pairs (R, L interleaved).
+  // SPH0645 with this wiring outputs on EVEN indices (R hardware channel).
   const int read_bytes = kDmaChunk * 2 * sizeof(int32_t);
   while (collected < kAudioSamples) {
     size_t bytes_read = 0;
     i2s_read(I2S_NUM_0, dma_buf, read_bytes, &bytes_read, pdMS_TO_TICKS(500));
-    int pairs    = (int)(bytes_read / (2 * sizeof(int32_t)));
-    int to_copy  = min(pairs, kAudioSamples - collected);
+    int n_pairs = (int)(bytes_read / sizeof(int32_t)) / 2;
+    int to_copy = min(n_pairs, kAudioSamples - collected);
     for (int i = 0; i < to_copy; i++) {
-      int32_t raw    = dma_buf[i * 2];
+      int32_t raw    = dma_buf[i * 2];  // even = R hardware channel = mic signal
       int16_t sample = (int16_t)(raw >> PCM_SHIFT);
       audio_buf[collected + i] = sample / 32768.0f;
     }
@@ -195,12 +248,11 @@ static float compute_rms(const float* buf, int n) {
 
 static void compute_log_mel() {
   float max_power = 1e-10f;
-
   for (int frame = 0; frame < kNFrames; frame++) {
     int start = frame * kHop;
     for (int k = 0; k < kNFft; k++) {
-      int   src = start + k;
-      float s   = (src < kAudioSamples) ? audio_buf[src] : 0.0f;
+      int src = start + k;
+      float s = (src < kAudioSamples) ? audio_buf[src] : 0.0f;
       fft_buf[2 * k]     = s * hann_win[k];
       fft_buf[2 * k + 1] = 0.0f;
     }
@@ -212,7 +264,6 @@ static void compute_log_mel() {
       float re = fft_buf[2 * k], im = fft_buf[2 * k + 1];
       power[k] = re * re + im * im;
     }
-
     float* row = mel_buf + frame * kNMels;
     for (int m = 0; m < kNMels; m++) {
       float val = 0.0f;
@@ -221,7 +272,6 @@ static void compute_log_mel() {
       if (val > max_power) max_power = val;
     }
   }
-
   const float ref_db = 10.0f * log10f(max_power);
   for (int i = 0; i < kNFrames * kNMels; i++) {
     float db = 10.0f * log10f(mel_buf[i] + 1e-10f) - ref_db;
@@ -231,25 +281,51 @@ static void compute_log_mel() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CNN inference (manual forward pass — no TFLite)
+// Inference
 // ─────────────────────────────────────────────────────────────────────────────
 
 static int run_inference(float probs_out[kNClasses]) {
-  cnn_infer(mel_buf, cnn_buf_a, cnn_buf_b, probs_out);
+  // Copy mel into input tensor — handles both float32 and INT8 IO models
+  if (input_tensor->type == kTfLiteFloat32) {
+    memcpy(input_tensor->data.f, mel_buf, kNFrames * kNMels * sizeof(float));
+  } else {
+    // INT8 input: quantize float → int8 using tensor's scale/zero_point
+    float   scale = input_tensor->params.scale;
+    int32_t zp    = input_tensor->params.zero_point;
+    for (int i = 0; i < kNFrames * kNMels; i++) {
+      int32_t v = (int32_t)roundf(mel_buf[i] / scale) + zp;
+      if (v < -128) v = -128;
+      if (v >  127) v =  127;
+      input_tensor->data.int8[i] = (int8_t)v;
+    }
+  }
 
-  float non_alert_sum = probs_out[2] + probs_out[3];
+  if (interpreter->Invoke() != kTfLiteOk) {
+    Serial.println("Invoke FAILED");
+    return -1;
+  }
 
+  // Read output probabilities — handles both float32 and INT8 IO models
+  if (output_tensor->type == kTfLiteFloat32) {
+    for (int i = 0; i < kNClasses; i++) probs_out[i] = output_tensor->data.f[i];
+  } else {
+    float   scale = output_tensor->params.scale;
+    int32_t zp    = output_tensor->params.zero_point;
+    for (int i = 0; i < kNClasses; i++)
+      probs_out[i] = (output_tensor->data.int8[i] - zp) * scale;
+  }
+
+  float non_alert  = probs_out[2] + probs_out[3];
   int   best_cls   = -1;
   float best_score = 0.0f;
   for (int i = 0; i < kNClasses; i++) {
     if (i == 2 || i == 3) continue;
     float score = probs_out[i];
     if (score >= kThresholds[i]
-     && score >= non_alert_sum + kNonAlertMargin
-     && non_alert_sum <= kNonAlertMaxCombined
+     && score >= non_alert + kNonAlertMargin
+     && non_alert <= kNonAlertMaxCombined
      && score > best_score) {
-      best_score = score;
-      best_cls   = i;
+      best_score = score; best_cls = i;
     }
   }
   return best_cls;
@@ -259,78 +335,177 @@ static int run_inference(float probs_out[kNClasses]) {
 // setup / loop
 // ─────────────────────────────────────────────────────────────────────────────
 
+#define DIAG(msg) do { Serial.println(msg); Serial.flush(); } while(0)
+#define DIAGF(fmt, ...) do { Serial.printf(fmt, ##__VA_ARGS__); Serial.flush(); } while(0)
+
 void setup() {
   Serial.begin(115200);
-  unsigned long t0 = millis();
-  while (!Serial && millis() - t0 < 8000) { delay(10); }
-  Serial.println("Care-home monitor booting...");
+  delay(3000);  // plain delay — while(!Serial) can deadlock on ESP32-S3 CDC
+  Serial.println("\n\n=== BOOT ==="); Serial.flush();
 
+  DIAGF("Chip: %s  Rev: %d  Cores: %d  Freq: %d MHz\n",
+        ESP.getChipModel(), ESP.getChipRevision(),
+        ESP.getChipCores(), ESP.getCpuFreqMHz());
+  DIAGF("Flash: %d KB  PSRAM: %d KB  Heap: %d KB\n",
+        (int)(ESP.getFlashChipSize() / 1024),
+        (int)(ESP.getPsramSize()     / 1024),
+        (int)(ESP.getFreeHeap()      / 1024));
+  DIAGF("model_data_len=%u bytes  arena=%d KB\n",
+        model_data_len, kArenaSize / 1024);
+
+  DIAG("Step 1: InitializeTarget");
+  tflite::InitializeTarget();
+
+  DIAG("Step 2: allocate buffers");
   auto xmalloc = [](size_t n) -> void* {
     void* p = ps_malloc(n); if (!p) p = malloc(n); return p;
   };
 
-  // CNN scratch buffers in PSRAM
-  cnn_buf_a = (float*)ps_malloc(200000 * sizeof(float));  // 775 KB
-  cnn_buf_b = (float*)ps_malloc( 50000 * sizeof(float));  // 192 KB
+  dma_buf      = (int32_t*)xmalloc(kDmaChunk * 2 * sizeof(int32_t));
+  audio_buf    = (float*)  xmalloc(kAudioSamples * sizeof(float));
+  fft_buf      = (float*)  xmalloc(kNFft * 2 * sizeof(float));
+  mel_buf      = (float*)  xmalloc(kNFrames * kNMels * sizeof(float));
+  hann_win     = (float*)  xmalloc(kNFft * sizeof(float));
+  DIAGF("  dma_buf=%p  audio_buf=%p  fft_buf=%p  mel_buf=%p  hann_win=%p\n",
+        dma_buf, audio_buf, fft_buf, mel_buf, hann_win);
 
-  // Audio buffers
-  dma_buf   = (int32_t*)xmalloc(kDmaChunk * 2 * sizeof(int32_t));
-  audio_buf = (float*)  xmalloc(kAudioSamples * sizeof(float));
-  fft_buf   = (float*)  xmalloc(kNFft * 2 * sizeof(float));
-  mel_buf   = (float*)  xmalloc(kNFrames * kNMels * sizeof(float));
-  hann_win  = (float*)  xmalloc(kNFft * sizeof(float));
+  DIAG("Step 3: allocate tensor arena (PSRAM)");
+  tensor_arena = (uint8_t*)heap_caps_malloc(kArenaSize,
+                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  DIAGF("  tensor_arena=%p  PSRAM free after: %d KB\n",
+        tensor_arena, (int)(ESP.getFreePsram() / 1024));
 
-  Serial.printf("PSRAM free: %d bytes\n", (int)ESP.getFreePsram());
-  if (!cnn_buf_a || !cnn_buf_b || !dma_buf || !audio_buf || !fft_buf || !mel_buf || !hann_win) {
-    Serial.println("ERROR: PSRAM allocation failed");
+  if (!dma_buf || !audio_buf || !fft_buf || !mel_buf || !hann_win || !tensor_arena) {
+    DIAG("ERROR: memory allocation failed — halting");
     while (true) delay(1000);
   }
 
-  // Hann window
+  DIAG("Step 4: Hann window");
   for (int i = 0; i < kNFft; i++)
     hann_win[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (kNFft - 1)));
 
-  // ESP-DSP FFT tables (overwrites hann_win as scratch)
-  Serial.println("Init: ESP-DSP FFT...");
+  DIAG("Step 5: ESP-DSP FFT init");
   dsps_fft2r_init_fc32(hann_win, kNFft);
   for (int i = 0; i < kNFft; i++)
     hann_win[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (kNFft - 1)));
 
-  Serial.println("Init: CNN model (no TFLite)...");
-  Serial.printf("  cnn_buf_a=%p  cnn_buf_b=%p\n", cnn_buf_a, cnn_buf_b);
-  Serial.println("  Weights in flash — no init needed");
-
-  if (!init_i2s()) {
-    Serial.println("ERROR: I2S init failed");
+  DIAG("Step 6: GetModel");
+  const tflite::Model* model = tflite::GetModel(model_data);
+  DIAGF("  model=%p  version=%d  expected=%d\n",
+        model, model ? (int)model->version() : -1, TFLITE_SCHEMA_VERSION);
+  if (!model || model->version() != TFLITE_SCHEMA_VERSION) {
+    DIAG("ERROR: bad model schema — halting");
     while (true) delay(1000);
   }
-  Serial.println("I2S ready");
 
+  DIAG("Step 7: op resolver");
+  static tflite::MicroMutableOpResolver<30> static_resolver;
+  static_resolver.AddConv2D();
+  static_resolver.AddReshape();
+  static_resolver.AddAdd();
+  static_resolver.AddFullyConnected();
+  static_resolver.AddBatchMatMul();
+  static_resolver.AddSoftmax();
+  static_resolver.AddTranspose();
+  static_resolver.AddMul();
+  static_resolver.AddMean();
+  static_resolver.AddRsqrt();
+  static_resolver.AddSub();
+  static_resolver.AddQuantize();
+  static_resolver.AddDequantize();
+  static_resolver.AddStridedSlice();
+  static_resolver.AddExpandDims();
+  static_resolver.AddRelu6();
+  static_resolver.AddShape();
+  static_resolver.AddPack();
+  static_resolver.AddSplit();
+  static_resolver.AddConcatenation();
+  static_resolver.AddGather();
+  static_resolver.AddUnpack();
+  static_resolver.AddNeg();
+  static_resolver.AddSquaredDifference();
+  DIAG("  ops registered");
+
+  DIAG("Step 8: MicroInterpreter");
+  static tflite::MicroInterpreter static_interpreter(
+    model, static_resolver, tensor_arena, kArenaSize);
+  interpreter = &static_interpreter;
+  DIAG("  interpreter created");
+
+  DIAG("Step 9: AllocateTensors");
+  TfLiteStatus alloc_status = interpreter->AllocateTensors();
+  DIAGF("  arena used: %d / %d bytes  status=%d\n",
+        (int)interpreter->arena_used_bytes(), kArenaSize, (int)alloc_status);
+  if (alloc_status != kTfLiteOk) {
+    DIAG("ERROR: AllocateTensors failed — halting");
+    while (true) delay(1000);
+  }
+  DIAG("  TFLite ready");
+
+  input_tensor  = interpreter->input(0);
+  output_tensor = interpreter->output(0);
+  DIAGF("  Input  type=%d  shape=[%d,%d,%d,%d]\n",
+        input_tensor->type,
+        input_tensor->dims->data[0], input_tensor->dims->data[1],
+        input_tensor->dims->data[2], input_tensor->dims->data[3]);
+  DIAGF("  Output type=%d  shape=[%d,%d]\n",
+        output_tensor->type,
+        output_tensor->dims->data[0], output_tensor->dims->data[1]);
+
+  DIAG("Step 10: I2S init");
+  if (!init_i2s()) {
+    DIAG("ERROR: I2S init failed — halting");
+    while (true) delay(1000);
+  }
+  DIAG("  I2S ready");
+  detect_channel();
+
+  DIAG("Step 11: WiFi");
   WiFi.mode(WIFI_STA);
   wifi_connect();
 
-  Serial.println("Ready — listening...");
+  DIAG("=== READY — listening ===");
 }
 
 void loop() {
   unsigned long now = millis();
-  if (now - last_heartbeat_ms >= HEARTBEAT_MS) {
+  if (now - last_heartbeat_ms >= kHeartbeatInterval) {
     post_heartbeat();
     last_heartbeat_ms = now;
   }
 
   collect_audio();
 
+  // Diagnostic: print raw DMA for both channels every 3 s
+  // dma_buf is [R0, L0, R1, L1, ...] — R=even, L=odd (SPH0645 with SEL=GND → L)
+  static unsigned long last_diag = 0;
+  if (millis() - last_diag > 3000) {
+    Serial.printf("R(even): %08lx %08lx  L(odd): %08lx %08lx  audio[L]: %.5f %.5f\n",
+      (unsigned long)dma_buf[0], (unsigned long)dma_buf[2],
+      (unsigned long)dma_buf[1], (unsigned long)dma_buf[3],
+      audio_buf[0], audio_buf[1]);
+    last_diag = millis();
+  }
+
   float rms = compute_rms(audio_buf, kAudioSamples);
-  if (rms < kRmsThreshold) return;
+  Serial.printf("RMS=%.5f\n", rms);
+  if (rms < kRmsThreshold) {
+    post_telemetry(rms, false, nullptr, 0, nullptr);
+    return;
+  }
 
   compute_log_mel();
 
   unsigned long t_infer = millis();
   float probs[kNClasses];
   int alert_cls = run_inference(probs);
-  Serial.printf("Inference: %lu ms  RMS=%.4f  fall=%.2f cough=%.2f norm=%.2f other=%.2f",
-    millis() - t_infer, rms, probs[0], probs[1], probs[2], probs[3]);
+  unsigned long infer_ms = millis() - t_infer;
+
+  const char* alert_name = (alert_cls >= 0) ? kClassNames[alert_cls] : nullptr;
+  Serial.printf("Inference: %lu ms  fall=%.2f cough=%.2f norm=%.2f other=%.2f",
+    infer_ms, probs[0], probs[1], probs[2], probs[3]);
+
+  post_telemetry(rms, true, probs, infer_ms, alert_name);
 
   if (alert_cls >= 0) {
     Serial.printf("  → ALERT: %s", kClassNames[alert_cls]);

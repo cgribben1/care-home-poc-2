@@ -27,18 +27,22 @@ def receive_telemetry():
 
 
 @app.route("/event", methods=["POST"])
+@app.route("/api/alert", methods=["POST"])
 def receive_event():
     data = request.get_json(force=True) or {}
     data["server_ts"] = time.time()
-    print(f"[ALERT] {data.get('class')}  conf={data.get('confidence', 0):.2f}")
+    label = data.get("event_type") or data.get("class", "?")
+    print(f"[ALERT] {label}  conf={data.get('confidence', 0):.2f}  device={data.get('device_id','?')}")
     socketio.emit("alert", data)
     return jsonify({"ok": True})
 
 
 @app.route("/heartbeat", methods=["POST"])
+@app.route("/api/heartbeat", methods=["POST"])
 def receive_heartbeat():
     data = request.get_json(force=True) or {}
     data["server_ts"] = time.time()
+    print(f"[HB] device={data.get('device_id','?')}  rssi={data.get('rssi_dbm','?')} dBm")
     socketio.emit("heartbeat", data)
     return jsonify({"ok": True})
 
