@@ -15,8 +15,8 @@ BASE_DIR = Path(__file__).resolve().parent
 app = Flask(__name__, static_folder=str(BASE_DIR / "server_ui"))
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-CALLMEBOT_PHONE  = os.environ.get("CALLMEBOT_PHONE", "")
-CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "")
+CALLMEBOT_PHONE  = os.environ.get("CALLMEBOT_PHONE", "447917453960")
+CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "4985760")
 
 
 def whatsapp_alert(message: str) -> None:
