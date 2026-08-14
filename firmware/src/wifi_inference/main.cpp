@@ -14,6 +14,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
 #include <esp_dsp.h>
@@ -28,6 +29,13 @@
 #include "wifi_config.h"
 #include "model_data.h"
 #include "mel_filterbank.h"
+
+#ifndef OTA_HOSTNAME
+#define OTA_HOSTNAME "care-home-monitor"
+#endif
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD "care-home-ota"
+#endif
 
 // ── I2S pins ─────────────────────────────────────────────────────────────────
 #ifndef PIN_I2S_SD
@@ -211,8 +219,7 @@ static void detect_channel() {
 
 static bool collect_audio() {
   int collected = 0;
-  // Stereo: read kDmaChunk pairs (R, L interleaved).
-  // SPH0645 with this wiring outputs on EVEN indices (R hardware channel).
+  int ota_tick  = 0;
   const int read_bytes = kDmaChunk * 2 * sizeof(int32_t);
   while (collected < kAudioSamples) {
     size_t bytes_read = 0;
@@ -220,11 +227,13 @@ static bool collect_audio() {
     int n_pairs = (int)(bytes_read / sizeof(int32_t)) / 2;
     int to_copy = min(n_pairs, kAudioSamples - collected);
     for (int i = 0; i < to_copy; i++) {
-      int32_t raw    = dma_buf[i * 2];  // even = R hardware channel = mic signal
+      int32_t raw    = dma_buf[i * 2];
       int16_t sample = (int16_t)(raw >> PCM_SHIFT);
       audio_buf[collected + i] = sample / 32768.0f;
     }
     collected += to_copy;
+    // Service OTA every ~10 DMA reads (~200 ms) so uploads don't time out
+    if (++ota_tick % 10 == 0) ArduinoOTA.handle();
   }
   return true;
 }
@@ -464,10 +473,25 @@ void setup() {
   WiFi.mode(WIFI_STA);
   wifi_connect();
 
+  DIAG("Step 12: OTA");
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]()  { Serial.println("OTA: start");  });
+  ArduinoOTA.onEnd([]()    { Serial.println("OTA: done — restarting"); });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    Serial.printf("OTA: %u%%\r", done * 100 / total);
+  });
+  ArduinoOTA.onError([](ota_error_t e) {
+    Serial.printf("OTA error[%u]\n", e);
+  });
+  ArduinoOTA.begin();
+  DIAGF("  OTA ready — hostname: %s\n", OTA_HOSTNAME);
+
   DIAG("=== READY — listening ===");
 }
 
 void loop() {
+  ArduinoOTA.handle();
   unsigned long now = millis();
   if (now - last_heartbeat_ms >= kHeartbeatInterval) {
     post_heartbeat();
